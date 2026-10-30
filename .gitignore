@@ -1,0 +1,13 @@
+# Derleme çıktıları
+build/
+*.exe
+*.o
+*.obj
+mini-notepad
+
+# Editör ve işletim sistemi dosyaları
+.vscode/
+.DS_Store
+
+# Yerel deneme dosyaları
+test.txt
