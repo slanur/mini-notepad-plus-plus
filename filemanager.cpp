@@ -159,7 +159,7 @@ void FileManager::render(const std::vector<FsEntry> &entries, int selected,
         }
 
         std::string icon = e.isDir ? " [K] " : " [F] ";
-        std::string line = icon + e.name;
+        std::string line = icon + Terminal::sanitize(e.name);
         while ((int)line.size() < cols) line += ' ';
         Terminal::print(line.substr(0, cols));
         Terminal::resetColor();
@@ -196,7 +196,8 @@ std::string FileManager::show(const std::string &mode, const std::string &startD
             if (selected < (int)entries.size() - 1) selected++;
 
         } else if (key == KEY_RIGHT ||
-                   (key == KEY_ENTER && selected < (int)entries.size() && entries[selected].isDir)) {
+                   (key == KEY_ENTER && selected < (int)entries.size() && entries[selected].isDir &&
+                    (inputBuf.empty() || entries[selected].name == inputBuf))) {
             // Klasore gir
             if (selected < (int)entries.size() && entries[selected].isDir) {
                 std::string name = entries[selected].name;
@@ -236,6 +237,11 @@ std::string FileManager::show(const std::string &mode, const std::string &startD
 
         } else if (key == KEY_BACKSPACE) {
             if (!inputBuf.empty()) inputBuf.pop_back();
+
+        } else if (key == KEY_PASTE) {
+            // Yapistirilan metnin sadece ilk satiri dosya adi olarak alinir
+            std::string pasted = Terminal::readPaste();
+            inputBuf += pasted.substr(0, pasted.find_first_of("\r\n"));
 
         } else if (key >= 32 && key < 256) {
             inputBuf += (char)key;

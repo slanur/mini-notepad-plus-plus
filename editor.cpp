@@ -1,19 +1,44 @@
 // editor.cpp
 
 #include "editor.h"
+#include "autosave.h"
+#include "pentest.h"
 #include "terminal.h"
 #include <algorithm>
 #include <sstream>
 #include <cstring>
 
+// UTF-8 devam bayti mi? (cok baytli karakterin ilk bayti olmayanlar)
+static bool isContByte(char c) { return ((unsigned char)c & 0xC0) == 0x80; }
+
+// Disaridan gelen metin: satir sonlari \n olur, sekmeler ekranda hizayi bozmasin diye bosluk olur
+static std::string normalizePastedText(const std::string &raw) {
+    std::string text;
+    text.reserve(raw.size());
+    for (size_t i = 0; i < raw.size(); i++) {
+        char c = raw[i];
+        if (c == '\r') {
+            if (i + 1 < raw.size() && raw[i + 1] == '\n') continue;
+            text += '\n';
+        } else if (c == '\t') {
+            text += "    ";
+        } else {
+            text += c;
+        }
+    }
+    return text;
+}
+
 Editor::Editor() {
     Terminal::setUTF8();
     Terminal::enableRawMode();
+    Terminal::enableBracketedPaste();
     Terminal::clearScreen();
     Terminal::setCursorBar();
 }
 
 Editor::~Editor() {
+    Terminal::disableBracketedPaste();
     Terminal::disableRawMode();
     Terminal::clearScreen();
     Terminal::moveCursor(1, 1);
@@ -23,28 +48,128 @@ Editor::~Editor() {
 }
 
 void Editor::run() {
+    checkRecovery();
+
     while (true) {
         Terminal::getSize(termRows_, termCols_);
-        toolboxHeight_ = toolbox_.height(termCols_);
+        toolboxHeight_ = toolbox_.height();
         refreshScreen();
-        int key = Terminal::readKey();
 
+        // Tus beklerken de yedek alinabilsin diye okuma dogrudan bloklanmaz
+        autosave();
+        while (!Terminal::waitForInput(1000)) autosave();
+
+        int key = Terminal::readKey();
+        statusMsg_.clear();
+
+        if (key == KEY_PASTE) { handlePaste(); continue; }
+
+        if (mode_ == EditorMode::RecoverPrompt) { handleRecoverKey(key); continue; }
         if (mode_ == EditorMode::Search)     { handleSearchKey(key);    continue; }
         if (mode_ == EditorMode::SearchNav)  { handleSearchNavKey(key); continue; }
         if (mode_ == EditorMode::Replace)    { handleReplaceKey(key);   continue; }
         if (mode_ == EditorMode::ExitPrompt) {
-            if (key == 'y' || key == 'Y') { saveFile(); break; }
+            if (key == 'y' || key == 'Y') {
+                saveFile();
+                if (!isDirty_) break;       // Kaydedilemediyse notu kaybetme
+                mode_ = EditorMode::Normal;
+            }
             if (key == 'n' || key == 'N') { break; }
             if (key == KEY_ESC)           { mode_ = EditorMode::Normal; }
             continue;
         }
 
+        // ESC once secimi ve vurgulari temizler; ancak temizlenecek bir sey yoksa cikar
+        bool escClearsState = key == KEY_ESC && (selectActive_ || !searchMatches_.empty());
+
         handleNormalKey(key);
 
-        if (key == KEY_ESC && mode_ == EditorMode::Normal) {
-            if (isDirty_) mode_ = EditorMode::ExitPrompt;
-            else          break;
-        }
+        if (key == KEY_ESC && !escClearsState && mode_ == EditorMode::Normal) break;
+    }
+
+    // Buraya yalnizca not kaydedildiyse veya kullanici vazgectiyse gelinir
+    clearAutosave();
+}
+
+bool Editor::loadFile(const std::string &path, bool createIfMissing) {
+    if (!buffer_.loadFromFile(path) && !createIfMissing) {
+        statusMsg_ = "Dosya acilamadi";
+        return false;
+    }
+    filePath_ = path; cursorLine_ = 0; cursorCol_ = 0;
+    viewportRow_ = 0; viewportCol_ = 0; isDirty_ = false;
+    undoStack_.clear(); redoStack_.clear(); searchMatches_.clear();
+    return true;
+}
+
+// Kaydedilmemis degisiklikleri yedekle; arada metin degismediyse diske dokunma
+void Editor::autosave() {
+    if (!isDirty_ || mode_ == EditorMode::RecoverPrompt) return;
+
+    std::time_t now = std::time(nullptr);
+    if (now - lastAutosaveTime_ < AUTOSAVE_SECONDS) return;
+    lastAutosaveTime_ = now;
+
+    std::string text = buffer_.getAllText();
+    if (text == lastAutosaveText_) return;
+
+    // Not adi degistiyse eski yedek ortada kalmasin
+    std::string path = Autosave::pathFor(filePath_);
+    if (path != autosavePath_) Autosave::remove(autosavePath_);
+    autosavePath_ = path;
+
+    if (Autosave::write(path, text)) lastAutosaveText_ = text;
+}
+
+void Editor::clearAutosave() {
+    Autosave::remove(autosavePath_);
+    autosavePath_.clear();
+    lastAutosaveText_.clear();
+}
+
+// Onceki oturumdan kalan yedek varsa geri yuklemeyi sor
+void Editor::checkRecovery() {
+    std::string path = Autosave::pathFor(filePath_);
+    std::string text;
+    if (!Autosave::read(path, text)) return;
+
+    autosavePath_ = path;
+    if (text == buffer_.getAllText()) { clearAutosave(); return; }
+
+    recoveryText_ = text;
+    mode_ = EditorMode::RecoverPrompt;
+}
+
+void Editor::handleRecoverKey(int key) {
+    if (key == 'y' || key == 'Y') {
+        buffer_.setText(recoveryText_);
+        lastAutosaveText_ = recoveryText_;
+        cursorLine_ = 0; cursorCol_ = 0;
+        viewportRow_ = 0; viewportCol_ = 0;
+        undoStack_.clear(); redoStack_.clear();
+        isDirty_ = true;
+        statusMsg_ = "Yedek geri yuklendi, kaydetmek icin Ctrl+S";
+    } else if (key == 'n' || key == 'N') {
+        clearAutosave();
+    } else {
+        return;
+    }
+    recoveryText_.clear();
+    mode_ = EditorMode::Normal;
+}
+
+// Terminalden yapistirma: tek geri alma adimi; arac ciktilari hizlica eklenir
+void Editor::handlePaste() {
+    std::string text = normalizePastedText(Terminal::readPaste());
+
+    if (mode_ == EditorMode::Normal) {
+        if (text.empty()) return;
+        if (selectActive_) deleteSelection();
+        saveUndoState();
+        insertString(text);
+        isDirty_ = true;
+    } else if (mode_ == EditorMode::Search || mode_ == EditorMode::Replace) {
+        searchInput_ += text.substr(0, text.find('\n'));
     }
 }
 
@@ -92,6 +217,16 @@ void Editor::adjustViewport() {
     else if (cursorLine_ >= viewportRow_ + textAreaRows)
         viewportRow_ = cursorLine_ - textAreaRows + 1;
     if (viewportRow_ < 0) viewportRow_ = 0;
+
+    // Yatay kaydirma: uzun komut ve URL satirlarinda imlec ekranda kalsin
+    LineNode *node = buffer_.lineAt(cursorLine_);
+    int displayCol = node ? byteToDisplayCol(node->text, cursorCol_) : 0;
+    int textCols   = termCols_ - 8;
+    if (displayCol < viewportCol_)
+        viewportCol_ = displayCol;
+    else if (displayCol >= viewportCol_ + textCols)
+        viewportCol_ = displayCol - textCols + 1;
+    if (viewportCol_ < 0) viewportCol_ = 0;
 }
 
 void Editor::refreshScreen() {
@@ -108,12 +243,15 @@ void Editor::refreshScreen() {
     if (mode_ == EditorMode::ExitPrompt)
         renderExitPrompt();
 
+    if (mode_ == EditorMode::RecoverPrompt)
+        renderRecoverPrompt();
+
     int textStartRow = toolboxHeight_ + 1;
     int screenRow    = textStartRow + (cursorLine_ - viewportRow_);
     int lineNumWidth = 8;
     std::string curLineText = buffer_.lineAt(cursorLine_) ? buffer_.lineAt(cursorLine_)->text : "";
     int displayCol  = byteToDisplayCol(curLineText, cursorCol_);
-    int screenCol   = lineNumWidth + displayCol + 1;
+    int screenCol   = lineNumWidth + displayCol - viewportCol_ + 1;
 
     Terminal::moveCursor(screenRow, screenCol);
     Terminal::showCursor();
@@ -149,8 +287,15 @@ void Editor::renderTextArea() {
         std::string text = node ? node->text : "";
         int textLen = (int)text.size();
 
-        // Her bayt icin renk: 0=normal, 1=arama(mavi), 2=secim(sari)
+        // Her bayt icin renk: 0=normal, 1=arama(mavi), 2=secim(sari), 3+=pentest belirteci
+        const int TOKEN_BASE = 3;
         std::vector<int> colorMap(textLen + 1, 0);
+
+        // IP, URL, CVE vb. en altta; arama ve secim bunlarin ustune boyanir
+        for (const Pentest::Token &t : Pentest::scanLine(text)) {
+            for (int k = t.start; k < t.start + t.len && k < textLen; k++)
+                colorMap[k] = TOKEN_BASE + (int)t.type;
+        }
 
         // Arama eslesmelerini isaretle (sadece eslesen kisim)
         for (auto &m : searchMatches_) {
@@ -184,7 +329,7 @@ void Editor::renderTextArea() {
         int screenCol = 8;
         int prevColorType = -1; // -1: henuz set edilmedi
 
-        int i = 0;
+        int i = displayColToByteIdx(text, viewportCol_);
         while (i < textLen && screenCol < termCols_) {
             int ct = colorMap[i];
 
@@ -196,6 +341,9 @@ void Editor::renderTextArea() {
                     Terminal::setColor(COLOR_WHITE, COLOR_BLUE);   // Arama: mavi bg
                 } else if (ct == 2) {
                     Terminal::setColor(COLOR_BLACK, COLOR_YELLOW); // Secim: sari bg
+                } else if (ct >= TOKEN_BASE) {
+                    Terminal::setColor(Pentest::tokenColor((Pentest::TokenType)(ct - TOKEN_BASE)),
+                                       COLOR_DEFAULT);
                 } else {
                     Terminal::setColor(COLOR_WHITE, COLOR_DEFAULT); // Normal
                 }
@@ -204,6 +352,16 @@ void Editor::renderTextArea() {
 
             // UTF-8 karakteri tamamen yaz (cok baytli karakterler icin)
             unsigned char c0 = (unsigned char)text[i];
+
+            // Kontrol karakterleri ham yazilmaz: hedeften gelen ciktilardaki
+            // kaçis kodlari terminali yonetemesin
+            if (c0 < 32 || c0 == 127) {
+                Terminal::printChar('.');
+                i++;
+                screenCol++;
+                continue;
+            }
+
             int charBytes = 1;
             if      ((c0 & 0xE0) == 0xC0) charBytes = 2;
             else if ((c0 & 0xF0) == 0xE0) charBytes = 3;
@@ -238,7 +396,8 @@ void Editor::renderStatusBar() {
     snprintf(posBuf, sizeof(posBuf), " Satir:%d  Sutun:%d  Eslesmeler:%d",
              cursorLine_+1, cursorCol_+1, (int)searchMatches_.size());
 
-    std::string bar = dirty + fname + posBuf;
+    std::string bar = dirty + Terminal::sanitize(fname) + posBuf;
+    if (!statusMsg_.empty()) bar += "  | " + Terminal::sanitize(statusMsg_);
     while ((int)bar.size() < termCols_) bar += ' ';
     Terminal::print(bar.substr(0, termCols_));
     Terminal::resetColor();
@@ -281,6 +440,15 @@ void Editor::renderExitPrompt() {
     Terminal::resetColor();
 }
 
+void Editor::renderRecoverPrompt() {
+    Terminal::moveCursor(termRows_-1, 1);
+    Terminal::setColor(COLOR_BLACK, COLOR_YELLOW);
+    std::string msg = " Kaydedilmemis bir yedek bulundu. Geri yuklensin mi? (y/n) ";
+    while ((int)msg.size() < termCols_) msg += ' ';
+    Terminal::print(msg.substr(0, termCols_));
+    Terminal::resetColor();
+}
+
 // Normal mod
 void Editor::handleNormalKey(int key) {
     switch (key) {
@@ -291,9 +459,19 @@ void Editor::handleNormalKey(int key) {
         case KEY_CTRL_G: startSearchNav(); return;
         case KEY_CTRL_H_KEY: startReplace(); return;
         case KEY_CTRL_Z: undo(); return;
+        case KEY_CTRL_Y: redo(); return;
+        case KEY_CTRL_K:
+        case KEY_F1:     showHelp(); return;
         case KEY_CTRL_C: copySelection(); return;
         case KEY_CTRL_X: cutSelection();  return;
         case KEY_CTRL_V: paste();         return;
+        case KEY_CTRL_T: insertTemplate();  return;
+        case KEY_CTRL_D: insertTimestamp(); return;
+        case KEY_CTRL_L: showSummary();     return;
+
+        case KEY_TAB:
+            if (selectActive_) deleteSelection();
+            saveUndoState(); insertString("    "); isDirty_ = true; return;
 
         case KEY_UP:
             if (selectActive_) clearSelection();
@@ -369,7 +547,9 @@ void Editor::handleNormalKey(int key) {
         default:
             if (key >= 32 && key < 256) {
                 if (selectActive_) deleteSelection();
-                saveUndoState(); insertChar((char)key); isDirty_ = true;
+                // Cok baytli karakterin devam baytlari ayni geri alma adimina girer
+                if (!isContByte((char)key)) saveUndoState();
+                insertChar((char)key); isDirty_ = true;
             }
             return;
     }
@@ -521,8 +701,11 @@ void Editor::moveCursorLeft(bool byWord) {
         while (pos > 0 && t[pos-1] != ' ') pos--;
         cursorCol_ = pos;
     } else {
-        if (cursorCol_ > 0) cursorCol_--;
-        else if (cursorLine_ > 0) { cursorLine_--; cursorCol_ = currentLineLen(); }
+        if (cursorCol_ > 0) {
+            const std::string &t = buffer_.lineAt(cursorLine_)->text;
+            cursorCol_--;
+            while (cursorCol_ > 0 && isContByte(t[cursorCol_])) cursorCol_--;
+        } else if (cursorLine_ > 0) { cursorLine_--; cursorCol_ = currentLineLen(); }
     }
     clampCursor();
 }
@@ -542,8 +725,11 @@ void Editor::moveCursorRight(bool byWord) {
         cursorCol_ = pos;
     } else {
         int len = currentLineLen();
-        if (cursorCol_ < len) cursorCol_++;
-        else if (cursorLine_ < buffer_.lineCount()-1) { cursorLine_++; cursorCol_ = 0; }
+        if (cursorCol_ < len) {
+            const std::string &t = buffer_.lineAt(cursorLine_)->text;
+            cursorCol_++;
+            while (cursorCol_ < len && isContByte(t[cursorCol_])) cursorCol_++;
+        } else if (cursorLine_ < buffer_.lineCount()-1) { cursorLine_++; cursorCol_ = 0; }
     }
     clampCursor();
 }
@@ -587,69 +773,129 @@ void Editor::deleteSelection() {
     isDirty_ = true;
 }
 
-void Editor::copySelection() { if (selectActive_) clipboard_ = getSelectedText(); }
-void Editor::cutSelection()  { if (selectActive_) { clipboard_ = getSelectedText(); deleteSelection(); } }
+// Secim yoksa bulunulan satir kopyalanir; "$ " oneki diger terminale yapistirilacak
+// komuta dahil olmasin diye atilir
+void Editor::copySelection() {
+    std::string text = getSelectedText();
+    if (!selectActive_) {
+        LineNode *node = buffer_.lineAt(cursorLine_);
+        if (node) text = node->text;
+        if (text.compare(0, 2, "$ ") == 0) text.erase(0, 2);
+    }
+    if (text.empty()) return;
+
+    clipboard_ = text;
+    statusMsg_ = Terminal::copyToSystemClipboard(text) ? "Panoya kopyalandi"
+                                                       : "Yalnizca editor panosuna kopyalandi";
+}
+
+void Editor::cutSelection() {
+    if (!selectActive_) return;
+    copySelection();
+    deleteSelection();
+}
 
 void Editor::paste() {
-    if (clipboard_.empty()) return;
+    std::string text;
+    if (!Terminal::readSystemClipboard(text) || text.empty()) text = clipboard_;
+    text = normalizePastedText(text);
+    if (text.empty()) return;
+
     if (selectActive_) deleteSelection();
     saveUndoState();
-    insertString(clipboard_);
+    insertString(text);
     isDirty_ = true;
 }
 
 void Editor::saveUndoState() {
     undoStack_.push(buffer_.getAllText(), cursorLine_, cursorCol_);
+    redoStack_.clear(); // Yeni degisiklik yineleme gecmisini gecersiz kilar
 }
 
-void Editor::undo() {
-    if (!undoStack_.canUndo()) return;
-    auto state = undoStack_.pop();
-    buffer_.~Buffer();
-    new (&buffer_) Buffer();
-    std::istringstream ss(state.text);
-    std::string ln;
-    bool firstLine = true;
-    while (std::getline(ss, ln)) {
-        if (firstLine) {
-            LineNode *node = buffer_.lineAt(0);
-            if (node) node->text = ln;
-            firstLine = false;
-        } else {
-            int last = buffer_.lineCount() - 1;
-            int lc   = buffer_.lineAt(last) ? (int)buffer_.lineAt(last)->text.size() : 0;
-            buffer_.splitLine(last, lc);
-            LineNode *n = buffer_.lineAt(last+1);
-            if (n) n->text = ln;
-        }
-    }
+void Editor::restoreState(const UndoState &state) {
+    buffer_.setText(state.text);
     cursorLine_ = state.cursorLine;
     cursorCol_  = state.cursorCol;
     clampCursor();
     isDirty_ = true;
 }
 
+void Editor::undo() {
+    if (!undoStack_.canUndo()) return;
+    redoStack_.push(buffer_.getAllText(), cursorLine_, cursorCol_);
+    restoreState(undoStack_.pop());
+}
+
+void Editor::redo() {
+    if (!redoStack_.canUndo()) return;
+    undoStack_.push(buffer_.getAllText(), cursorLine_, cursorCol_);
+    restoreState(redoStack_.pop());
+}
+
 void Editor::openFile() {
-    Terminal::disableRawMode(); Terminal::showCursor();
+    if (isDirty_) { statusMsg_ = "Kaydedilmemis degisiklik var, once Ctrl+S"; return; }
     std::string path = fileManager_.show("open");
-    Terminal::enableRawMode(); Terminal::hideCursor(); Terminal::setCursorBar();
-    if (!path.empty() && buffer_.loadFromFile(path)) {
-        filePath_ = path; cursorLine_ = 0; cursorCol_ = 0;
-        viewportRow_ = 0; isDirty_ = false;
-        undoStack_.clear(); searchMatches_.clear();
-    }
+    Terminal::clearScreen();
+    if (!path.empty() && loadFile(path)) checkRecovery();
 }
 
 void Editor::saveFile() {
     if (filePath_.empty()) { saveFileAs(); return; }
-    if (buffer_.saveToFile(filePath_)) isDirty_ = false;
+    if (buffer_.saveToFile(filePath_)) {
+        isDirty_ = false;
+        statusMsg_ = "Kaydedildi";
+        clearAutosave();
+    } else {
+        statusMsg_ = "Kaydedilemedi!";
+    }
 }
 
 void Editor::saveFileAs() {
-    Terminal::disableRawMode(); Terminal::showCursor();
     std::string path = fileManager_.show("save");
-    Terminal::enableRawMode(); Terminal::hideCursor(); Terminal::setCursorBar();
+    Terminal::clearScreen();
     if (!path.empty()) { filePath_ = path; saveFile(); }
+}
+
+// Ctrl+T: secilen not sablonunu imlecin bulundugu yere ekle
+void Editor::insertTemplate() {
+    int idx = Pentest::pickTemplate();
+    Terminal::clearScreen();
+    if (idx < 0) return;
+    if (selectActive_) deleteSelection();
+    saveUndoState();
+    if (cursorCol_ > 0) newLine();
+    insertString(Pentest::renderTemplate(idx));
+    isDirty_ = true;
+}
+
+// Ctrl+D: test gunlugu icin zaman damgasi ekle
+void Editor::insertTimestamp() {
+    if (selectActive_) deleteSelection();
+    saveUndoState();
+    insertString("[" + Pentest::timestamp() + "] ");
+    isDirty_ = true;
+}
+
+// Ctrl+K / F1: tum kisayollar
+void Editor::showHelp() {
+    Pentest::showList(" Klavye Kisayollari", " [yukari/asagi] Gez  [ESC] Geri", toolbox_.helpRows());
+    Terminal::clearScreen();
+}
+
+// Ctrl+L: nottaki bulgu, IP, URL vb. listesi; secilen kaydin satirina gider
+void Editor::showSummary() {
+    std::vector<std::string> lines;
+    for (LineNode *node = buffer_.firstLine(); node; node = node->next)
+        lines.push_back(node->text);
+
+    int target = Pentest::showSummary(lines);
+    Terminal::clearScreen();
+    if (target >= 0) {
+        clearSelection();
+        cursorLine_ = target;
+        cursorCol_  = 0;
+        clampCursor();
+    }
 }
 
 void Editor::startSearch() {

@@ -1,13 +1,13 @@
 #pragma once
 // toolbox.h — Üst şerit (Toolbox) çizimi
-// Komutlar tek satırda yan yana gösterilir; sığmazsa ikinci satıra geçer.
+// Not alanına yer kalsın diye tek satırdır; tüm kısayollar yardım ekranındadır.
 
 #include <string>
 #include <vector>
 
 struct ToolboxItem {
     std::string label;    ///< Görünen ad
-    std::string shortcut; ///< Kısayol (parantez içinde gösterilir)
+    std::string shortcut; ///< Kısayol
 };
 
 class Toolbox {
@@ -17,13 +17,13 @@ public:
     /// Toolbox'ı ekrana çiz; çizilen satır sayısını döndür
     int render(int termCols) const;
 
-    /// Kaç satır kapladığını hesapla (editor'ün metin alanı başlangıcını bulmak için)
-    int height(int termCols) const;
+    /// Kaç satır kapladığını döndür (editor'ün metin alanı başlangıcını bulmak için)
+    int height() const { return 1; }
+
+    /// Yardım ekranının satırları
+    std::vector<std::string> helpRows() const;
 
 private:
-    std::vector<ToolboxItem> items_;
-
-    // Tek satır çiz; kalan items index ve items listesini döndürür
-    int renderLine(int row, int termCols,
-                   const std::vector<ToolboxItem> &items, int startIdx) const;
+    std::vector<ToolboxItem> hints_; ///< Üst şeritte gösterilen en sık kısayollar
+    std::vector<ToolboxItem> help_;  ///< Yardım ekranındaki tüm kısayollar
 };

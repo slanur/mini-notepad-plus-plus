@@ -7,18 +7,11 @@
 #include <stdexcept>
 
 int main(int argc, char *argv[]) {
-    (void)argc;
-    (void)argv;
-
     try {
         Editor editor;
 
-        // Komut satırından dosya yolu verilmişse aç
-        if (argc > 1) {
-            // Editor sınıfı içinde openFile() public API'ye ihtiyaç var.
-            // Şimdilik run() öncesi manuel yükleme yapılabilir.
-            // (Genişletme: Editor::loadFile(path) eklenebilir)
-        }
+        // Komut satırından dosya yolu verilmişse aç; yoksa bu adla yeni dosya başlar
+        if (argc > 1) editor.loadFile(argv[1], true);
 
         editor.run();
     } catch (const std::exception &e) {

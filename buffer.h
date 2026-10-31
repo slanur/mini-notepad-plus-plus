@@ -31,6 +31,9 @@ public:
     // Tüm içeriği dosyaya yaz
     bool saveToFile(const std::string &path) const;
 
+    // İçeriği verilen metinle değiştir (getAllText'in tersi; geri alma ve kurtarma için)
+    void setText(const std::string &text);
+
     // ── Navigasyon ────────────────────────────────────────────────────────
     int  lineCount() const { return lineCount_; }
     LineNode *firstLine() const { return head_; }

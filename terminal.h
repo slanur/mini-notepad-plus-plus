@@ -43,6 +43,11 @@ enum Key {
     KEY_CTRL_S,   // Kaydet
     KEY_CTRL_O,   // Aç
     KEY_CTRL_W,   // Farklı kaydet
+    KEY_CTRL_T,   // Şablon ekle
+    KEY_CTRL_D,   // Zaman damgası ekle
+    KEY_CTRL_L,   // Özet paneli
+    KEY_CTRL_K,   // Yardım ekranı
+    KEY_PASTE,    // Terminal yapıştırması başladı (metni readPaste() okur)
 };
 
 // ── Renk sabitleri ────────────────────────────────────────────────────────
@@ -72,6 +77,16 @@ void disableRawMode();
 /// Tek tuş oku (bloke eder). Genişletilmiş tuşlar için Key enum değeri döner.
 int readKey();
 
+/// En fazla timeoutMs kadar girdi bekle; girdi geldiyse true döner
+bool waitForInput(int timeoutMs);
+
+/// Bracketed paste: terminal yapıştırılan metni işaretler, tek işlem olarak okunur
+void enableBracketedPaste();
+void disableBracketedPaste();
+
+/// KEY_PASTE sonrası yapıştırılan metni bitiş işaretine kadar oku
+std::string readPaste();
+
 /// İmleci (row, col) koordinatına taşı. 1-tabanlı.
 void moveCursor(int row, int col);
 
@@ -97,6 +112,14 @@ void showCursor();
 /// Yanıp sönen dikey çizgi imleci (cursor block <-> bar)
 void setCursorBar();
 void setCursorBlock();
+
+/// Sistem panosuna yaz / panodan oku. Pano aracı yoksa veya Windows'ta false döner.
+/// macOS: pbcopy/pbpaste, Linux: wl-clipboard veya xclip
+bool copyToSystemClipboard(const std::string &text);
+bool readSystemClipboard(std::string &text);
+
+/// Kontrol karakterlerini '.' ile değiştir (dosya içeriğindeki kaçış kodları terminale ulaşmasın)
+std::string sanitize(const std::string &s);
 
 /// Ham string yaz (renk/pozisyon zaten ayarlandıktan sonra)
 void print(const std::string &s);

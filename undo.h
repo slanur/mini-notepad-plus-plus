@@ -1,9 +1,10 @@
 #pragma once
 // undo.h — Stack tabanlı geri alma (Undo) mekanizması
 // Her düzenleme öncesi durum snapshot olarak tutulur.
+// Editör iki örnek kullanır: biri geri alma, diğeri yineleme (redo) için.
 
 #include <string>
-#include <stack>
+#include <deque>
 
 // Basit snapshot tabanlı undo: her değişiklik öncesi tamponun tüm metni
 // ve imleç pozisyonu kaydedilir. Büyük dosyalarda bellek maliyeti artar,
@@ -23,7 +24,7 @@ public:
     void push(const std::string &text, int cursorLine, int cursorCol);
 
     /// Geri alma durumu var mı?
-    bool canUndo() const { return !stack_.empty(); }
+    bool canUndo() const { return !states_.empty(); }
 
     /// Son kaydedilen durumu çıkar
     UndoState pop();
@@ -31,8 +32,8 @@ public:
     /// Tüm geçmişi temizle
     void clear();
 
-    int size() const { return (int)stack_.size(); }
+    int size() const { return (int)states_.size(); }
 
 private:
-    std::stack<UndoState> stack_;
+    std::deque<UndoState> states_; ///< Sınır aşılınca en eski durum baştan silinir
 };

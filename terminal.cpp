@@ -12,9 +12,11 @@
   static DWORD  oldStdinMode  = 0;
   static DWORD  oldStdoutMode = 0;
 #else
+  #include <csignal>
   #include <termios.h>
   #include <unistd.h>
   #include <sys/ioctl.h>
+  #include <sys/select.h>
   static struct termios origTermios;
 #endif
 
@@ -108,12 +110,15 @@ int readKey() {
         if (vk == VK_END)    return KEY_END;
         if (vk == VK_PRIOR)  return KEY_PAGE_UP;
         if (vk == VK_NEXT)   return KEY_PAGE_DOWN;
+        if (vk == VK_F1)     return KEY_F1;
 
         // Ctrl + harf kombinasyonlari
         if (isCtrl) {
             if ((unsigned char)ch >= 32) return (unsigned char)ch;
             switch (vk) {
                 case 'Z': return KEY_CTRL_Z;
+                case 'Y': return KEY_CTRL_Y;
+                case 'K': return KEY_CTRL_K;
                 case 'F': return KEY_CTRL_F;
                 case 'G': return KEY_CTRL_G;
                 case 'C': return KEY_CTRL_C;
@@ -122,6 +127,9 @@ int readKey() {
                 case 'S': return KEY_CTRL_S;
                 case 'O': return KEY_CTRL_O;
                 case 'W': return KEY_CTRL_W;
+                case 'T': return KEY_CTRL_T;
+                case 'D': return KEY_CTRL_D;
+                case 'L': return KEY_CTRL_L;
                 case 'R': return KEY_CTRL_H_KEY; // Ctrl+R = Degistir
                 default: continue;
             }
@@ -149,6 +157,12 @@ int readKey() {
 
         if (n == 0) return KEY_ESC;
 
+        // ESC O P: cogu terminalde F1
+        if (buf[1] == 'O') {
+            read(STDIN_FILENO, buf + 2, 1);
+            return buf[2] == 'P' ? KEY_F1 : KEY_NONE;
+        }
+
         if (buf[1] == '[') {
             n = read(STDIN_FILENO, buf + 2, 1);
             if (n == 0) return KEY_ESC;
@@ -156,6 +170,7 @@ int readKey() {
             if (buf[2] == '1') {
                 unsigned char extra[4] = {};
                 read(STDIN_FILENO, extra, 3);
+                if (extra[0] == '1' && extra[1] == '~') return KEY_F1; // ESC[11~
                 if (extra[0] == ';') {
                     char mod = extra[1], dir = extra[2];
                     if (mod == '5') {
@@ -180,6 +195,13 @@ int readKey() {
                 case 'D': return KEY_LEFT;
                 case 'H': return KEY_HOME;
                 case 'F': return KEY_END;
+                case '2': {
+                    // ESC[200~ yapistirma baslangici, ESC[2~ Insert tusu
+                    std::string seq;
+                    unsigned char c = 0;
+                    while (read(STDIN_FILENO, &c, 1) == 1 && c != '~') seq += (char)c;
+                    return seq == "00" ? KEY_PASTE : KEY_NONE;
+                }
                 case '3': { read(STDIN_FILENO, buf, 1); return KEY_DELETE; }
                 case '5': { read(STDIN_FILENO, buf, 1); return KEY_PAGE_UP; }
                 case '6': { read(STDIN_FILENO, buf, 1); return KEY_PAGE_DOWN; }
@@ -192,24 +214,121 @@ int readKey() {
     // Ctrl + karakter (ASCII kontrol kodlari)
     switch (buf[0]) {
         case 3:   return KEY_CTRL_C;
+        case 4:   return KEY_CTRL_D;
         case 6:   return KEY_CTRL_F;
         case 7:   return KEY_CTRL_G;
         case 8:   return KEY_CTRL_BACKSPACE; // Ctrl+Backspace (bazi terminaller)
         case '\t': return KEY_TAB;
         case '\n':
         case '\r': return KEY_ENTER;
+        case 11:  return KEY_CTRL_K;
+        case 12:  return KEY_CTRL_L;
         case 15:  return KEY_CTRL_O;
         case 18:  return KEY_CTRL_H_KEY;  // Ctrl+R (ASCII 18) = Degistir
         case 19:  return KEY_CTRL_S;
+        case 20:  return KEY_CTRL_T;
         case 22:  return KEY_CTRL_V;
         case 23:  return KEY_CTRL_W;
         case 24:  return KEY_CTRL_X;
+        case 25:  return KEY_CTRL_Y;
         case 26:  return KEY_CTRL_Z;
         case 127: return KEY_BACKSPACE;   // Normal Backspace (DEL)
     }
 
     return (int)(unsigned char)buf[0];
 #endif
+}
+
+bool waitForInput(int timeoutMs) {
+#ifdef PLATFORM_WINDOWS
+    return WaitForSingleObject(GetStdHandle(STD_INPUT_HANDLE), (DWORD)timeoutMs) == WAIT_OBJECT_0;
+#else
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    struct timeval tv;
+    tv.tv_sec  = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    return select(STDIN_FILENO + 1, &fds, nullptr, nullptr, &tv) != 0;
+#endif
+}
+
+#ifndef PLATFORM_WINDOWS
+// Komutlar sabit metindir; pano icerigi kabuga degil, boru uzerinden gider.
+// Turkce karakterler bozulmasin diye pbcopy/pbpaste UTF-8 yerel ayariyla calisir.
+#ifdef __APPLE__
+static const char *const COPY_COMMAND  = "LC_CTYPE=UTF-8 pbcopy 2>/dev/null";
+static const char *const PASTE_COMMAND = "LC_CTYPE=UTF-8 pbpaste 2>/dev/null";
+#else
+static const char *const COPY_COMMAND =
+    "wl-copy >/dev/null 2>&1 || xclip -selection clipboard >/dev/null 2>&1";
+static const char *const PASTE_COMMAND =
+    "wl-paste -n 2>/dev/null || xclip -selection clipboard -o 2>/dev/null";
+#endif
+#endif
+
+bool copyToSystemClipboard(const std::string &text) {
+#ifdef PLATFORM_WINDOWS
+    (void)text;
+    return false;
+#else
+    // Pano araci yoksa kabuk erken kapanir; yazma SIGPIPE ile editoru oldurmesin
+    void (*oldHandler)(int) = signal(SIGPIPE, SIG_IGN);
+    FILE *pipe = popen(COPY_COMMAND, "w");
+    bool ok = false;
+    if (pipe) {
+        ok = fwrite(text.data(), 1, text.size(), pipe) == text.size();
+        ok = pclose(pipe) == 0 && ok;
+    }
+    signal(SIGPIPE, oldHandler);
+    return ok;
+#endif
+}
+
+bool readSystemClipboard(std::string &text) {
+#ifdef PLATFORM_WINDOWS
+    (void)text;
+    return false;
+#else
+    FILE *pipe = popen(PASTE_COMMAND, "r");
+    if (!pipe) return false;
+    text.clear();
+    char chunk[4096];
+    size_t got;
+    while ((got = fread(chunk, 1, sizeof(chunk), pipe)) > 0) text.append(chunk, got);
+    return pclose(pipe) == 0;
+#endif
+}
+
+void enableBracketedPaste()  { fputs("\033[?2004h", stdout); fflush(stdout); }
+void disableBracketedPaste() { fputs("\033[?2004l", stdout); fflush(stdout); }
+
+std::string readPaste() {
+#ifdef PLATFORM_WINDOWS
+    return "";
+#else
+    static const std::string endMark = "\033[201~";
+    std::string text;
+    char c;
+    while (read(STDIN_FILENO, &c, 1) == 1) {
+        text += c;
+        if (text.size() >= endMark.size() &&
+            text.compare(text.size() - endMark.size(), endMark.size(), endMark) == 0) {
+            text.resize(text.size() - endMark.size());
+            break;
+        }
+    }
+    return text;
+#endif
+}
+
+std::string sanitize(const std::string &s) {
+    std::string out = s;
+    for (char &c : out) {
+        unsigned char u = (unsigned char)c;
+        if (u < 32 || u == 127) c = '.';
+    }
+    return out;
 }
 
 void moveCursor(int row, int col) {

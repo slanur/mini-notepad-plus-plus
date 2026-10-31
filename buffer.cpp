@@ -98,6 +98,20 @@ bool Buffer::saveToFile(const std::string &path) const {
     return true;
 }
 
+void Buffer::setText(const std::string &text) {
+    clear();
+    size_t start = 0;
+    while (true) {
+        size_t newline = text.find('\n', start);
+        if (newline == std::string::npos) {
+            appendLine(text.substr(start));
+            return;
+        }
+        appendLine(text.substr(start, newline - start));
+        start = newline + 1;
+    }
+}
+
 // ── Navigasyon ───────────────────────────────────────────────────────────
 LineNode *Buffer::lineAt(int index) const {
     if (index < 0 || index >= lineCount_) return nullptr;

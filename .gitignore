@@ -9,5 +9,9 @@ mini-notepad
 .vscode/
 .DS_Store
 
+# Otomatik yedekler (not içeriği taşır)
+*.autosave
+*.autosave.tmp
+
 # Yerel deneme dosyaları
 test.txt
